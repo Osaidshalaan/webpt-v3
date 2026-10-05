@@ -816,7 +816,8 @@ def score_hypotheses(signals: List[Signal],
                      variant_headers: Optional[Dict] = None,
                      baseline: Optional[LayerSnapshot] = None,
                      variant: Optional[LayerSnapshot] = None,
-                     variant_path_is_new: bool = False) -> List[Hypothesis]:
+                     variant_path_is_new: bool = False,
+                     variant_method: str = "GET") -> List[Hypothesis]:
     kinds = {s.kind for s in signals}
     vh = {k.lower(): v for k, v in (variant_headers or {}).items()}
     bh = baseline.headers if baseline else {}
@@ -881,6 +882,11 @@ def score_hypotheses(signals: List[Signal],
         and variant is not None
         and variant.status in (206, 416)
     )
+    has_method_rejection = (
+        variant_method.upper() != "GET"
+        and variant is not None
+        and variant.status in (400, 405, 415, 422, 500, 501, 505)
+    )
 
     hypotheses = [
         Hypothesis("session variance", "benign",
@@ -907,6 +913,10 @@ def score_hypotheses(signals: List[Signal],
         Hypothesis("server does not support method", "benign",
                    ["status_reversal", "status_class_shift", "body_delta"],
                    0.95 if has_method_unsupported else 0.0),
+        Hypothesis("server rejects method or body", "benign",
+                   ["status_reversal", "status_class_shift", "body_delta",
+                    "compression_variance"],
+                   0.95 if has_method_rejection else 0.0),
         Hypothesis("edge enforces host integrity", "benign",
                    ["status_reversal", "status_class_shift", "body_delta",
                     "cache_layer_disagreement"],
@@ -1242,6 +1252,7 @@ class ExplainedDiffer:
                     signals, variant_headers=v_headers,
                     baseline=main, variant=snap,
                     variant_path_is_new=(url.split("?", 1)[0].rstrip("/") != base_url.split("?", 1)[0].rstrip("/")),
+                    variant_method=method,
                 )
                 top = hyps[0] if hyps else None
                 positive_signals = [s for s in signals if s.severity_weight > 0]

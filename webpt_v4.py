@@ -387,7 +387,8 @@ class ExplainedDifferV4:
         signals = extract_signals(main, snap, v.get("headers") or {})
         hyps = score_hypotheses(
             signals, variant_headers=v.get("headers") or {},
-            baseline=main, variant=snap, variant_path_is_new=True)
+            baseline=main, variant=snap, variant_path_is_new=True,
+            variant_method=v.get("method", "GET"))
         top = hyps[0] if hyps else None
         positive = [s for s in signals if s.severity_weight > 0]
         corroborating = [s for s in positive
