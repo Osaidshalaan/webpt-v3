@@ -1209,8 +1209,9 @@ class ExplainedDiffer:
                 positive_signals = [s for s in signals if s.severity_weight > 0]
                 _corroborating = [s for s in positive_signals
                                   if s.kind in ("sensitive_header_delta",
-                                                "cache_layer_disagreement",
-                                                "status_class_shift")]
+                                                "status_class_shift",
+                                                "status_reversal",
+                                                "auth_challenge_changed")]
                 agreeing = len(positive_signals) >= 2 and len(_corroborating) >= 1
                 is_violation = top is not None and top.kind == "boundary_violation"
                 violation_evidence = [s.detail for s in positive_signals]

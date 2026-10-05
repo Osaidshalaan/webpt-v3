@@ -392,8 +392,9 @@ class ExplainedDifferV4:
         positive = [s for s in signals if s.severity_weight > 0]
         corroborating = [s for s in positive
                          if s.kind in ("sensitive_header_delta",
-                                       "cache_layer_disagreement",
-                                       "status_class_shift")]
+                                       "status_class_shift",
+                                       "status_reversal",
+                                       "auth_challenge_changed")]
         agreeing = len(positive) >= 2 and len(corroborating) >= 1
         is_violation = top is not None and top.kind == "boundary_violation"
         conf = min(0.92, max(0.15, sum(s.severity_weight for s in positive)))
