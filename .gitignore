@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+webpt_v3_report.txt
+webpt_v3_report.json
+report.txt
+report.json
+*.tar.gz
+*.bak
+*.working
+*.py.bak
