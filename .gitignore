@@ -3,9 +3,15 @@ __pycache__/
 *.pyc
 webpt_v3_report.txt
 webpt_v3_report.json
+webpt_v4_report.txt
+webpt_v4_report.json
+webpt_v5_report.txt
+webpt_v5_report.json
 report.txt
 report.json
 *.tar.gz
 *.bak
 *.working
 *.py.bak
+juice_run.log
+juice_live.log
