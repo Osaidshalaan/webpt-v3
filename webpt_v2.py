@@ -219,12 +219,36 @@ def normalize_ephemeral(body: bytes) -> bytes:
         text = body.decode("utf-8", errors="strict")
     except (UnicodeDecodeError, ValueError):
         return body
-    text = re.sub(r"[A-Za-z0-9+/=_-]{40,}", "<TOK>", text)
+    text = re.sub(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", "<UUID>", text)
+    text = re.sub(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}", "<JWT>", text)
+    text = re.sub(r"[A-Za-z0-9+/=_-]{40,}={0,2}", "<TOK>", text)
+    text = re.sub(r"(?<![0-9a-fA-F])[0-9a-fA-F]{24,}(?![0-9a-fA-F])", "<HEX>", text)
+    text = re.sub(r"(?<!\d)\d{10,}(?!\d)", "<NUM>", text)
     text = re.sub(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?", "<TSISO>", text)
     text = re.sub(r"[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT", "<TSRFC>", text)
-    text = re.sub(r"(?<!\d)1[6-9]\d{11}(?!\d)", "<TSMS>", text)
-    text = re.sub(r"(?<!\d)1[6-9]\d{8}(?!\d)", "<TSS>", text)
+    text = re.sub(r"(?:%[0-9A-Fa-f]{2}){2,}", "<PCT>", text)
+    text = re.sub(r"[^\x00-\x7F]+", "<UNI>", text)
     return text.encode("utf-8")
+
+
+def bodies_similar(a: bytes, b: bytes, threshold: float = 0.02) -> bool:
+    """Byte-diff fallback for CDN challenge pages that nonce-shape differently
+    than the regex normalizer expects."""
+    if not a or not b:
+        return False
+    n = max(len(a), len(b))
+    if abs(len(a) - len(b)) > n * 0.20:
+        return False
+    if n > 100_000:
+        step = n // 50_000 + 1
+        diff = tot = 0
+        for i in range(0, min(len(a), len(b)), step):
+            tot += 1
+            if a[i] != b[i]:
+                diff += 1
+        return (diff / max(1, tot)) < threshold
+    diff = sum(1 for x, y in zip(a, b) if x != y) + abs(len(a) - len(b))
+    return (diff / n) < threshold
 
 
 def title_of(html: bytes) -> str:
@@ -1104,6 +1128,12 @@ class Validator:
             v_ok = variant2.body_hash_norm == original_variant.body_hash_norm
         else:
             v_ok = variant2.body_hash == original_variant.body_hash
+        if not b_ok and bodies_similar(baseline.body_raw, baseline2.body_raw):
+            b_ok = True
+            notes.append("baseline_similar_not_exact")
+        if not v_ok and bodies_similar(original_variant.body_raw, variant2.body_raw):
+            v_ok = True
+            notes.append("variant_similar_not_exact")
         if not b_ok:
             notes.append(f"baseline_not_reproduced: {baseline.body_hash} != {baseline2.body_hash}")
         if not v_ok:
