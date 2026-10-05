@@ -130,6 +130,9 @@ class LayerSnapshot:
     technologies: List[str]
     raw_headers: str
     notes: List[str] = field(default_factory=list)
+    body_raw: bytes = b""
+    elapsed_ms: int = 0
+    body_hash_norm: str = ""
 
 
 @dataclass
@@ -207,6 +210,21 @@ def normalize(url: str) -> str:
 
 def sha16(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()[:16]
+
+
+def normalize_ephemeral(body: bytes) -> bytes:
+    if not body or len(body) > 2_000_000:
+        return body
+    try:
+        text = body.decode("utf-8", errors="strict")
+    except (UnicodeDecodeError, ValueError):
+        return body
+    text = re.sub(r"[A-Za-z0-9+/=_-]{40,}", "<TOK>", text)
+    text = re.sub(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?", "<TSISO>", text)
+    text = re.sub(r"[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT", "<TSRFC>", text)
+    text = re.sub(r"(?<!\d)1[6-9]\d{11}(?!\d)", "<TSMS>", text)
+    text = re.sub(r"(?<!\d)1[6-9]\d{8}(?!\d)", "<TSS>", text)
+    return text.encode("utf-8")
 
 
 def title_of(html: bytes) -> str:
@@ -353,24 +371,30 @@ class HttpEngine:
 
     async def fetch(self, url: str, method: str = "GET",
                     headers: Optional[Dict] = None,
-                    allow_redirects: bool = True) -> Optional[LayerSnapshot]:
+                    allow_redirects: bool = True,
+                    body: Optional[bytes] = None) -> Optional[LayerSnapshot]:
         async with self.sem:
             t0 = time.monotonic()
             try:
                 async with self.session.request(
                     method, url, headers=headers or {},
-                    allow_redirects=allow_redirects, ssl=False
+                    data=body, allow_redirects=allow_redirects, ssl=False
                 ) as resp:
-                    body = await resp.read()
+                    body_bytes = await resp.read()
                     hdrs = {k.lower(): v for k, v in resp.headers.items()}
                     self.stats["ok"] += 1
+                    elapsed = int((time.monotonic()-t0)*1000)
+                    norm = normalize_ephemeral(body_bytes)
                     return LayerSnapshot(
                         layer=Layer.UNKNOWN, headers=hdrs, status=resp.status,
-                        body_hash=sha16(body), body_len=len(body),
-                        title=title_of(body) if "html" in hdrs.get("content-type", "") else "",
-                        technologies=detect_tech(hdrs, body),
+                        body_hash=sha16(body_bytes), body_len=len(body_bytes),
+                        title=title_of(body_bytes) if "html" in hdrs.get("content-type", "") else "",
+                        technologies=detect_tech(hdrs, body_bytes),
                         raw_headers="\n".join(f"{k}: {v}" for k, v in resp.headers.items()),
-                        notes=[f"elapsed_ms={int((time.monotonic()-t0)*1000)}"],
+                        notes=[f"elapsed_ms={elapsed}"],
+                        body_raw=body_bytes,
+                        elapsed_ms=elapsed,
+                        body_hash_norm=sha16(norm),
                     )
             except asyncio.TimeoutError:
                 reason = "timeout"
@@ -661,12 +685,79 @@ def _sig_compression_variance(base: LayerSnapshot, var: LayerSnapshot,
     return None
 
 
+def _sig_time_delta(base, var, vh=None):
+    if not base.elapsed_ms or not var.elapsed_ms:
+        return None
+    if base.elapsed_ms < 200:
+        return None
+    if var.elapsed_ms > base.elapsed_ms * 4 and (var.elapsed_ms - base.elapsed_ms) > 500:
+        return Signal(kind="time_delta", rules_out="stable upstream performance",
+                      detail=f"{base.elapsed_ms}ms -> {var.elapsed_ms}ms", severity_weight=0.3)
+    return None
+
+
+def _sig_ephemeral_only(base, var, vh=None):
+    if base.body_hash == var.body_hash:
+        return None
+    if base.body_hash_norm and var.body_hash_norm and base.body_hash_norm == var.body_hash_norm:
+        return Signal(kind="ephemeral_only",
+                      rules_out="nothing - bodies match after stripping per-request tokens",
+                      detail="raw bodies differ, normalized bodies match",
+                      severity_weight=-0.4, requires_corroboration=False)
+    return None
+
+
+def _sig_status_class_shift(base, var, vh=None):
+    if base.status == var.status:
+        return None
+    bc, vc = base.status // 100, var.status // 100
+    if bc == vc:
+        return None
+    return Signal(kind="status_class_shift", rules_out="no class boundary crossed",
+                  detail=f"{base.status} -> {var.status} ({bc}xx -> {vc}xx)", severity_weight=0.5)
+
+
+def _sig_auth_challenge_changed(base, var, vh=None):
+    if "www-authenticate" not in base.headers and "www-authenticate" not in var.headers:
+        return None
+    if base.headers.get("www-authenticate") == var.headers.get("www-authenticate"):
+        return None
+    return Signal(kind="auth_challenge_changed", rules_out="stable auth boundary",
+                  detail="WWW-Authenticate changed", severity_weight=0.4)
+
+
+def _sig_redirect_target_delta(base, var, vh=None):
+    bl = base.headers.get("location", "")
+    vl = var.headers.get("location", "")
+    if bl == vl or (not bl and not vl):
+        return None
+    return Signal(kind="redirect_target_delta", rules_out="stable redirect policy",
+                  detail=f"location {bl!r} -> {vl!r}", severity_weight=0.3)
+
+
+def _sig_content_type_confusion(base, var, vh=None):
+    bc = base.headers.get("content-type", "").split(";")[0].strip()
+    vc = var.headers.get("content-type", "").split(";")[0].strip()
+    if not bc or not vc or bc == vc:
+        return None
+    if base.body_hash != var.body_hash:
+        return None
+    return Signal(kind="content_type_confusion", rules_out="consistent representation",
+                  detail=f"same body, content-type {bc} -> {vc}", severity_weight=0.4)
+
+
 SIGNAL_FUNCS = (
     _sig_status_reversal,
+    _sig_status_class_shift,
     _sig_body_delta,
     _sig_sensitive_header_delta,
     _sig_cache_layer_disagreement,
     _sig_compression_variance,
+    _sig_time_delta,
+    _sig_ephemeral_only,
+    _sig_auth_challenge_changed,
+    _sig_redirect_target_delta,
+    _sig_content_type_confusion,
 )
 
 
@@ -741,6 +832,10 @@ def score_hypotheses(signals: List[Signal],
         and variant.status in (200, 204, 301, 302)
         and variant.body_len == 0
     )
+    has_method_unsupported = (
+        variant is not None
+        and variant.status == 501
+    )
 
     hypotheses = [
         Hypothesis("session variance", "benign",
@@ -764,11 +859,46 @@ def score_hypotheses(signals: List[Signal],
         Hypothesis("method semantics differ", "benign",
                    ["status_reversal", "body_delta", "compression_variance"],
                    0.95 if has_method_semantics else 0.0),
-        Hypothesis("layer interpretation mismatch", "boundary_violation",
-                   ["status_reversal", "body_delta", "sensitive_header_delta",
+        Hypothesis("server does not support method", "benign",
+                   ["status_reversal", "status_class_shift", "body_delta"],
+                   0.95 if has_method_unsupported else 0.0),
+        Hypothesis("challenge page rotation", "benign",
+                   ["ephemeral_only", "body_delta"],
+                   0.95 if any(s.kind == "ephemeral_only" for s in signals) else 0.0),
+        Hypothesis("rate limiting or throttling", "benign",
+                   ["time_delta", "status_reversal"],
+                   0.85 if any(s.kind == "time_delta" for s in signals) else 0.0),
+        Hypothesis("slow upstream, no policy change", "benign",
+                   ["time_delta"],
+                   0.6 if any(s.kind == "time_delta" for s in signals) else 0.0),
+        Hypothesis("auth challenge refresh", "benign",
+                   ["auth_challenge_changed"],
+                   0.7 if any(s.kind == "auth_challenge_changed" for s in signals) else 0.0),
+        Hypothesis("redirect policy variance", "benign",
+                   ["redirect_target_delta"],
+                   0.6 if any(s.kind == "redirect_target_delta" for s in signals) else 0.0),
+        Hypothesis("content-type rewrite at edge", "benign",
+                   ["content_type_confusion"],
+                   0.5 if any(s.kind == "content_type_confusion" for s in signals) else 0.0),
+        Hypothesis("cache key ignores header", "benign",
+                   ["cache_layer_disagreement"],
+                   0.5 if has_cache_variance else 0.0),
+        Hypothesis("path encoded, decoded downstream", "boundary_violation",
+                   ["status_reversal", "status_class_shift", "body_delta",
+                    "sensitive_header_delta"], 0.0),
+        Hypothesis("header not stripped at edge", "boundary_violation",
+                   ["status_reversal", "sensitive_header_delta",
                     "cache_layer_disagreement"], 0.0),
+        Hypothesis("case routing bypass", "boundary_violation",
+                   ["status_reversal", "status_class_shift", "body_delta"], 0.0),
+        Hypothesis("smuggling primitive accepted", "boundary_violation",
+                   ["status_reversal", "time_delta", "sensitive_header_delta"], 0.0),
+        Hypothesis("layer interpretation mismatch", "boundary_violation",
+                   ["status_reversal", "status_class_shift", "body_delta",
+                    "sensitive_header_delta", "cache_layer_disagreement"], 0.0),
         Hypothesis("different upstream answered", "boundary_violation",
-                   ["status_reversal", "sensitive_header_delta"], 0.0),
+                   ["status_reversal", "status_class_shift",
+                    "sensitive_header_delta"], 0.0),
     ]
     for h in hypotheses:
         matched = [k for k in h.explains if k in kinds]
@@ -930,9 +1060,17 @@ class Validator:
         if not variant2 or variant2.status == 0:
             return False, ["variant_reprobe_failed"] + (variant2.notes if variant2 else [])
 
-        if baseline2.body_hash != baseline.body_hash:
+        if baseline2.body_hash_norm and baseline.body_hash_norm:
+            b_ok = baseline2.body_hash_norm == baseline.body_hash_norm
+        else:
+            b_ok = baseline2.body_hash == baseline.body_hash
+        if variant2.body_hash_norm and original_variant.body_hash_norm:
+            v_ok = variant2.body_hash_norm == original_variant.body_hash_norm
+        else:
+            v_ok = variant2.body_hash == original_variant.body_hash
+        if not b_ok:
             notes.append(f"baseline_not_reproduced: {baseline.body_hash} != {baseline2.body_hash}")
-        if variant2.body_hash != original_variant.body_hash:
+        if not v_ok:
             notes.append(f"variant_not_reproduced: {original_variant.body_hash} != {variant2.body_hash}")
         if baseline2.status != baseline.status:
             notes.append(f"baseline_status_drift: {baseline.status} != {baseline2.status}")
@@ -940,6 +1078,67 @@ class Validator:
             notes.append(f"variant_status_drift: {original_variant.status} != {variant2.status}")
 
         return (len(notes) == 0), notes
+
+
+# ---------------------------------------------------------------------------
+# Probe library - 50 probes across 12 families.
+# ---------------------------------------------------------------------------
+
+PROBE_LIBRARY: List[Dict[str, Any]] = [
+    {"cat":"fwd_ip","headers":{"X-Forwarded-For":"127.0.0.1"},"label":"xff-localhost","boundary":Boundary.WAF_ORIGIN,"tests_assumption":"Edge and origin share the same view of client IP"},
+    {"cat":"fwd_ip","headers":{"X-Forwarded-For":"192.168.1.1"},"label":"xff-private","boundary":Boundary.WAF_ORIGIN,"tests_assumption":"Origin trusts forwarded-for private range"},
+    {"cat":"fwd_ip","headers":{"X-Real-IP":"127.0.0.1"},"label":"x-real-ip","boundary":Boundary.WAF_ORIGIN,"tests_assumption":"Origin trusts X-Real-IP from external client"},
+    {"cat":"fwd_ip","headers":{"X-Client-IP":"127.0.0.1"},"label":"x-client-ip","boundary":Boundary.WAF_ORIGIN,"tests_assumption":"Origin trusts X-Client-IP from external client"},
+    {"cat":"fwd_ip","headers":{"X-Originating-IP":"127.0.0.1"},"label":"x-originating-ip","boundary":Boundary.WAF_ORIGIN,"tests_assumption":"Origin trusts X-Originating-IP"},
+    {"cat":"fwd_ip","headers":{"X-Remote-Addr":"127.0.0.1"},"label":"x-remote-addr","boundary":Boundary.WAF_ORIGIN,"tests_assumption":"Origin trusts X-Remote-Addr"},
+    {"cat":"rewrite","headers":{"X-Original-URL":"/admin"},"path_suffix":"/admin","label":"x-original-url","boundary":Boundary.WAF_ORIGIN,"tests_assumption":"Path interpreted identically by WAF and origin"},
+    {"cat":"rewrite","headers":{"X-Rewrite-URL":"/admin"},"path_suffix":"/admin","label":"x-rewrite-url","boundary":Boundary.WAF_ORIGIN,"tests_assumption":"Rewrite headers stripped before origin"},
+    {"cat":"rewrite","headers":{"X-Forwarded-Prefix":"/admin"},"path_suffix":"/admin","label":"x-forwarded-prefix","boundary":Boundary.WAF_ORIGIN,"tests_assumption":"Forwarded prefix not injected into routing"},
+    {"cat":"rewrite","headers":{"X-Sendfile":"/etc/passwd"},"label":"x-sendfile","boundary":Boundary.WAF_ORIGIN,"tests_assumption":"X-Sendfile not honored by external clients"},
+    {"cat":"method_override","headers":{"X-HTTP-Method-Override":"PUT"},"label":"x-http-method-override","boundary":Boundary.ORIGIN_APP,"tests_assumption":"Method override headers ignored"},
+    {"cat":"method_override","headers":{"X-HTTP-Method":"DELETE"},"label":"x-http-method","boundary":Boundary.ORIGIN_APP,"tests_assumption":"X-HTTP-Method ignored"},
+    {"cat":"method_override","headers":{"X-Method-Override":"PUT"},"label":"x-method-override","boundary":Boundary.ORIGIN_APP,"tests_assumption":"X-Method-Override ignored"},
+    {"cat":"method_override","path_suffix":"?_method=PUT","label":"query-method-override","boundary":Boundary.ORIGIN_APP,"tests_assumption":"Query method override ignored"},
+    {"cat":"cache_key","headers":{"X-Host":"localhost"},"label":"x-host-mismatch","boundary":Boundary.WAF_ORIGIN,"tests_assumption":"Cache and origin agree on host"},
+    {"cat":"cache_key","headers":{"X-Forwarded-Host":"localhost"},"label":"xfh-mismatch","boundary":Boundary.WAF_ORIGIN,"tests_assumption":"Cache and origin agree on forwarded host"},
+    {"cat":"cache_key","headers":{"X-Forwarded-Scheme":"http"},"label":"xfs-http","boundary":Boundary.WAF_ORIGIN,"tests_assumption":"Cache and origin agree on scheme"},
+    {"cat":"cache_key","headers":{"X-Original-Host":"localhost"},"label":"x-original-host","boundary":Boundary.WAF_ORIGIN,"tests_assumption":"X-Original-Host not honored"},
+    {"cat":"path_norm","path_suffix":"/.","label":"trailing-dot","boundary":Boundary.WAF_ORIGIN,"tests_assumption":"Path normalization identical"},
+    {"cat":"path_norm","path_suffix":"/;","label":"semicolon","boundary":Boundary.WAF_ORIGIN,"tests_assumption":"Semicolon truncation handled same"},
+    {"cat":"path_norm","path_suffix":"//","label":"double-slash","boundary":Boundary.WAF_ORIGIN,"tests_assumption":"Double slash collapsed identically"},
+    {"cat":"path_norm","path_suffix":"///","label":"triple-slash","boundary":Boundary.WAF_ORIGIN,"tests_assumption":"Triple slash collapsed identically"},
+    {"cat":"path_norm","path_suffix":"/%2e%2e/","label":"enc-dotdot","boundary":Boundary.WAF_ORIGIN,"tests_assumption":"Encoded traversal not decoded before WAF check"},
+    {"cat":"path_norm","path_suffix":"/..%2f","label":"dotdot-slash-enc","boundary":Boundary.WAF_ORIGIN,"tests_assumption":"Half-encoded traversal blocked at same layer"},
+    {"cat":"path_norm","path_suffix":"/%2e%2e%2f","label":"enc-dotdot-slash","boundary":Boundary.WAF_ORIGIN,"tests_assumption":"Fully-encoded traversal blocked"},
+    {"cat":"path_norm","path_suffix":"/.%2e/","label":"mixed-dot-enc","boundary":Boundary.WAF_ORIGIN,"tests_assumption":"Mixed-encoded traversal blocked"},
+    {"cat":"path_norm","path_suffix":"/%252e%252e/","label":"double-enc-dotdot","boundary":Boundary.WAF_ORIGIN,"tests_assumption":"Double-encoded traversal blocked"},
+    {"cat":"path_norm","path_suffix":"/%c0%af","label":"overlong-slash","boundary":Boundary.WAF_ORIGIN,"tests_assumption":"Overlong UTF-8 slash rejected identically"},
+    {"cat":"case","path_suffix":"/ADMIN","label":"admin-upper","boundary":Boundary.WAF_ORIGIN,"tests_assumption":"Routing case-sensitive at all layers"},
+    {"cat":"case","path_suffix":"/Admin","label":"admin-title","boundary":Boundary.WAF_ORIGIN,"tests_assumption":"Routing case-sensitive at all layers"},
+    {"cat":"case","headers":{"X-ORIGINAL-URL":"/admin"},"path_suffix":"/admin","label":"xor-case-upper","boundary":Boundary.WAF_ORIGIN,"tests_assumption":"Header name case does not affect rewrite"},
+    {"cat":"ext","path_suffix":"/admin.json","label":"admin-json","boundary":Boundary.WAF_ORIGIN,"tests_assumption":"Extension not stripped before policy check"},
+    {"cat":"ext","path_suffix":"/admin.html","label":"admin-html","boundary":Boundary.WAF_ORIGIN,"tests_assumption":"HTML extension does not bypass filter"},
+    {"cat":"ext","path_suffix":"/admin.php","label":"admin-php","boundary":Boundary.WAF_ORIGIN,"tests_assumption":"PHP extension does not bypass filter"},
+    {"cat":"ext","path_suffix":"/admin/","label":"admin-trailing","boundary":Boundary.WAF_ORIGIN,"tests_assumption":"Trailing slash handled identically"},
+    {"cat":"encoding","path_suffix":"/%2f","label":"enc-slash","boundary":Boundary.WAF_ORIGIN,"tests_assumption":"Encoded slash rejected or decoded identically"},
+    {"cat":"encoding","path_suffix":"/%5c","label":"enc-backslash","boundary":Boundary.WAF_ORIGIN,"tests_assumption":"Backslash normalized identically"},
+    {"cat":"encoding","path_suffix":"/%00","label":"null-byte","boundary":Boundary.WAF_ORIGIN,"tests_assumption":"Null byte rejected at same layer"},
+    {"cat":"encoding","path_suffix":"/%09","label":"tab-char","boundary":Boundary.WAF_ORIGIN,"tests_assumption":"Tab in path rejected identically"},
+    {"cat":"cookie","headers":{"Cookie":"role=admin"},"label":"cookie-role-admin","boundary":Boundary.ORIGIN_APP,"tests_assumption":"Authorization not driven by unauth cookie"},
+    {"cat":"cookie","headers":{"Cookie":"is_admin=true"},"label":"cookie-is-admin","boundary":Boundary.ORIGIN_APP,"tests_assumption":"Authorization not driven by unauth cookie"},
+    {"cat":"cookie","headers":{"Cookie":"debug=true"},"label":"cookie-debug","boundary":Boundary.ORIGIN_APP,"tests_assumption":"Debug flags not exposed via cookie"},
+    {"cat":"cookie","headers":{"X-Custom-IP-Authorization":"127.0.0.1"},"label":"custom-ip-auth","boundary":Boundary.WAF_ORIGIN,"tests_assumption":"Custom internal-auth headers not honored externally"},
+    {"cat":"query","path_suffix":"?debug=1","label":"query-debug","boundary":Boundary.ORIGIN_APP,"tests_assumption":"Debug query flags do not change authorization"},
+    {"cat":"query","path_suffix":"?test=1","label":"query-test","boundary":Boundary.ORIGIN_APP,"tests_assumption":"Test query flags do not change response"},
+    {"cat":"query","path_suffix":"?admin=1","label":"query-admin","boundary":Boundary.ORIGIN_APP,"tests_assumption":"Admin query flags not trusted"},
+    {"cat":"content_neg","headers":{"Accept":"application/json","X-Requested-With":"XMLHttpRequest"},"label":"force-json","boundary":Boundary.ORIGIN_APP,"tests_assumption":"Content negotiation does not expose different data"},
+    {"cat":"content_neg","headers":{"Accept":"application/xml"},"label":"force-xml","boundary":Boundary.ORIGIN_APP,"tests_assumption":"XML negotiation does not expose different data"},
+    {"cat":"method_semantics","method":"OPTIONS","label":"options","boundary":Boundary.ORIGIN_APP,"tests_assumption":"OPTIONS handled consistently"},
+    {"cat":"method_semantics","method":"TRACE","label":"trace","boundary":Boundary.ORIGIN_APP,"tests_assumption":"TRACE disabled or handled identically"},
+    {"cat":"smuggling","headers":{"Transfer-Encoding":"chunked","Content-Length":"0"},"method":"POST","body":b"","label":"te-cl","boundary":Boundary.WAF_ORIGIN,"tests_assumption":"TE and CL not both honored"},
+    {"cat":"smuggling","headers":{"Transfer-Encoding":"xchunked"},"method":"POST","body":b"","label":"te-obfuscated","boundary":Boundary.WAF_ORIGIN,"tests_assumption":"Obfuscated TE rejected"},
+    {"cat":"smuggling","headers":{"Transfer-Encoding":"identity"},"method":"POST","body":b"","label":"te-identity","boundary":Boundary.WAF_ORIGIN,"tests_assumption":"TE identity rejected or ignored"},
+]
 
 
 # ---------------------------------------------------------------------------
@@ -954,107 +1153,88 @@ class ExplainedDiffer:
         self.enable_validation = enable_validation
 
     async def run(self, base_url: str, main: LayerSnapshot) -> List[DiffExplanation]:
-        variants = [
-            {"headers": {"X-Forwarded-For": "127.0.0.1"}, "label": "xff-localhost",
-             "boundary": Boundary.WAF_ORIGIN,
-             "tests_assumption": "Edge and origin share the same view of client IP"},
-            {"headers": {"X-Original-URL": "/admin"}, "path_suffix": "/admin",
-             "label": "x-original-url", "boundary": Boundary.WAF_ORIGIN,
-             "tests_assumption": "Path is interpreted identically by WAF and origin/app"},
-            {"headers": {"X-Rewrite-URL": "/admin"}, "path_suffix": "/admin",
-             "label": "x-rewrite-url", "boundary": Boundary.WAF_ORIGIN,
-             "tests_assumption": "Rewrite headers are not trusted or are stripped before origin"},
-            {"headers": {"X-Custom-IP-Authorization": "127.0.0.1"},
-             "label": "custom-ip-auth", "boundary": Boundary.WAF_ORIGIN,
-             "tests_assumption": "Custom internal-auth headers are not honored externally"},
-            {"method": "OPTIONS", "label": "options",
-             "boundary": Boundary.ORIGIN_APP,
-             "tests_assumption": "OPTIONS handled consistently"},
-            {"path_suffix": "/.", "label": "trailing-dot",
-             "boundary": Boundary.WAF_ORIGIN,
-             "tests_assumption": "Path normalization identical at edge and origin"},
-            {"path_suffix": "/;", "label": "semicolon",
-             "boundary": Boundary.WAF_ORIGIN,
-             "tests_assumption": "Semicolon path truncation handled same by all layers"},
-            {"path_suffix": "%2e%2e/%2e%2e/etc/passwd", "label": "encoded-traversal",
-             "boundary": Boundary.WAF_ORIGIN,
-             "tests_assumption": "Encoding decoded at same layer that enforces rules"},
-            {"headers": {"Accept": "application/json", "X-Requested-With": "XMLHttpRequest"},
-             "label": "force-json", "boundary": Boundary.ORIGIN_APP,
-             "tests_assumption": "Content negotiation does not expose different data"},
-        ]
+        variants = PROBE_LIBRARY
+        sem = asyncio.Semaphore(8)
 
+        async def probe_one(v):
+            async with sem:
+                url = base_url.rstrip("/") + v.get("path_suffix", "")
+                method = v.get("method", "GET")
+                v_headers = v.get("headers") or {}
+                v_body = v.get("body")
+                snap = await self.http.fetch(url, method=method, headers=v_headers,
+                                             allow_redirects=False, body=v_body)
+                if not snap or snap.status == 0:
+                    return None
+                header_delta = {}
+                for k in set(main.headers) | set(snap.headers):
+                    b, a = main.headers.get(k, ""), snap.headers.get(k, "")
+                    if b != a:
+                        header_delta[k] = (b, a)
+                signals = extract_signals(main, snap, v_headers)
+                hyps = score_hypotheses(
+                    signals, variant_headers=v_headers,
+                    baseline=main, variant=snap,
+                    variant_path_is_new=(url.split("?", 1)[0].rstrip("/") != base_url.split("?", 1)[0].rstrip("/")),
+                )
+                top = hyps[0] if hyps else None
+                positive_signals = [s for s in signals if s.severity_weight > 0]
+                _corroborating = [s for s in positive_signals
+                                  if s.kind in ("sensitive_header_delta",
+                                                "cache_layer_disagreement",
+                                                "status_class_shift")]
+                agreeing = len(positive_signals) >= 2 and len(_corroborating) >= 1
+                is_violation = top is not None and top.kind == "boundary_violation"
+                violation_evidence = [s.detail for s in positive_signals]
+                ruled_out = [s.rules_out for s in positive_signals]
+                interesting = is_violation and agreeing
+                conf = sum(s.severity_weight for s in positive_signals)
+                conf = min(0.92, max(0.15, conf))
+                relationship = (
+                    f"Variant '{v['label']}' [{v.get('cat','general')}] tests assumption: "
+                    f"{v['tests_assumption']}. Baseline layer~{main.layer.value}, variant status={snap.status}."
+                )
+                d = DiffExplanation(
+                    baseline=main, variant=snap,
+                    status_delta=(main.status, snap.status),
+                    header_delta=header_delta,
+                    body_delta=snap.body_len - main.body_len,
+                    relationship=relationship,
+                    boundary=v["boundary"],
+                    violation_evidence=violation_evidence,
+                    normal_explanations_ruled_out=ruled_out,
+                    confidence=conf,
+                    interesting=interesting,
+                    signals=signals,
+                    hypotheses=hyps,
+                    baseline_url=base_url,
+                    variant_url=url,
+                    variant_method=method,
+                    variant_headers=v_headers,
+                )
+                return (v, d, snap)
+
+        raw = await asyncio.gather(*(probe_one(v) for v in variants))
         results = []
-        for v in variants:
-            url = base_url.rstrip("/") + v.get("path_suffix", "")
-            method = v.get("method", "GET")
-            v_headers = v.get("headers") or {}
-            snap = await self.http.fetch(url, method=method, headers=v_headers,
-                                         allow_redirects=False)
-            if not snap or snap.status == 0:
+        interesting_pairs = []
+        for item in raw:
+            if item is None:
                 continue
-
-            header_delta = {}
-            for k in set(main.headers) | set(snap.headers):
-                b, a = main.headers.get(k, ""), snap.headers.get(k, "")
-                if b != a:
-                    header_delta[k] = (b, a)
-
-            signals = extract_signals(main, snap, v_headers)
-            _base_clean = base_url.split("?", 1)[0].rstrip("/")
-            _var_clean = url.split("?", 1)[0].rstrip("/")
-            _variant_path_is_new = (_var_clean != _base_clean)
-            hyps = score_hypotheses(signals, variant_headers=v_headers,
-                                    baseline=main, variant=snap,
-                                    variant_path_is_new=_variant_path_is_new)
-            top = hyps[0] if hyps else None
-
-            positive_signals = [s for s in signals if s.severity_weight > 0]
-            _corroborating = [s for s in positive_signals
-                              if s.kind in ("sensitive_header_delta",
-                                            "cache_layer_disagreement")]
-            agreeing = len(positive_signals) >= 2 and len(_corroborating) >= 1
-            is_violation = top is not None and top.kind == "boundary_violation"
-
-            violation_evidence = [s.detail for s in positive_signals]
-            ruled_out = [s.rules_out for s in positive_signals]
-            interesting = is_violation and agreeing
-            conf = sum(s.severity_weight for s in positive_signals)
-            conf = min(0.92, max(0.15, conf))
-
-            relationship = (
-                f"Variant '{v['label']}' tests assumption: {v['tests_assumption']}. "
-                f"Baseline layer≈{main.layer.value}, variant status={snap.status}."
-            )
-
-            d = DiffExplanation(
-                baseline=main, variant=snap,
-                status_delta=(main.status, snap.status),
-                header_delta=header_delta,
-                body_delta=snap.body_len - main.body_len,
-                relationship=relationship,
-                boundary=v["boundary"],
-                violation_evidence=violation_evidence,
-                normal_explanations_ruled_out=ruled_out,
-                confidence=conf,
-                interesting=interesting,
-                signals=signals,
-                hypotheses=hyps,
-                baseline_url=base_url,
-                variant_url=url,
-                variant_method=method,
-                variant_headers=v_headers,
-            )
-
-            if interesting and self.enable_validation and self.validator is not None:
+            v, d, snap = item
+            results.append(d)
+            if d.interesting:
+                interesting_pairs.append((v, d, snap))
+        if self.enable_validation and self.validator is not None:
+            for v, d, snap in interesting_pairs:
                 ok, notes = await self.validator.validate(base_url, v, main, snap)
                 d.validation_reproduced = ok
                 d.validation_notes = notes
                 if not ok:
                     d.interesting = False
-                    d.normal_explanations_ruled_out.append("validation failed — delta not reproducible")
-            results.append(d)
+                    d.normal_explanations_ruled_out.append(
+                        "validation failed - delta not reproducible")
         return results
+
 
 
 # ---------------------------------------------------------------------------
