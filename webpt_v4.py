@@ -187,6 +187,7 @@ def build_smuggling_probes(target_host: str) -> List[Dict[str, Any]]:
     cl_te_body = b"0\r\n\r\nG"
     probes.append({
         "cat": "smuggling_raw", "label": "raw-cl-te",
+        "headers": {"Content-Length": "4", "Transfer-Encoding": "chunked"},
         "boundary": Boundary.WAF_ORIGIN,
         "tests_assumption": "Front-end and origin agree on framing (CL vs TE)",
         "raw_request": (
@@ -203,6 +204,7 @@ def build_smuggling_probes(target_host: str) -> List[Dict[str, Any]]:
     )
     probes.append({
         "cat": "smuggling_raw", "label": "raw-te-cl",
+        "headers": {"Content-Length": "4", "Transfer-Encoding": "chunked"},
         "boundary": Boundary.WAF_ORIGIN,
         "tests_assumption": "Front-end and origin agree on framing (TE vs CL)",
         "raw_request": (
@@ -214,6 +216,7 @@ def build_smuggling_probes(target_host: str) -> List[Dict[str, Any]]:
 
     probes.append({
         "cat": "smuggling_raw", "label": "raw-te-obfuscated",
+        "headers": {"Transfer-Encoding": "xchunked"},
         "boundary": Boundary.WAF_ORIGIN,
         "tests_assumption": "Obfuscated Transfer-Encoding rejected",
         "raw_request": (
@@ -224,6 +227,7 @@ def build_smuggling_probes(target_host: str) -> List[Dict[str, Any]]:
 
     probes.append({
         "cat": "smuggling_raw", "label": "raw-te-space-colon",
+        "headers": {"Transfer-Encoding": "chunked"},
         "boundary": Boundary.WAF_ORIGIN,
         "tests_assumption": "TE with whitespace before colon rejected",
         "raw_request": (
@@ -234,6 +238,7 @@ def build_smuggling_probes(target_host: str) -> List[Dict[str, Any]]:
 
     probes.append({
         "cat": "smuggling_raw", "label": "raw-double-te",
+        "headers": {"Transfer-Encoding": "chunked, identity"},
         "boundary": Boundary.WAF_ORIGIN,
         "tests_assumption": "Duplicate Transfer-Encoding rejected",
         "raw_request": (
@@ -265,6 +270,7 @@ def build_host_probes(target_host: str) -> List[Dict[str, Any]]:
         ).encode()
         probes.append({
             "cat": "host_matrix", "label": label,
+            "headers": {"Host": h},
             "boundary": Boundary.INTERNET_WAF,
             "tests_assumption": f"Host header {h!r} not honored differently",
             "raw_request": req,

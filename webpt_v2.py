@@ -836,6 +836,22 @@ def score_hypotheses(signals: List[Signal],
         variant is not None
         and variant.status == 501
     )
+    _vh_lower = {k.lower() for k in vh.keys()}
+    has_host_mutation = "host" in _vh_lower
+    has_te_mutation = "transfer-encoding" in _vh_lower
+    has_cl_mutation = "content-length" in _vh_lower
+    has_host_reject = (
+        has_host_mutation and variant is not None
+        and variant.status in (400, 403, 404, 421, 444, 500)
+    )
+    has_host_redirect = (
+        has_host_mutation and variant is not None
+        and variant.status in (301, 302, 307, 308)
+    )
+    has_framing_reject = (
+        (has_te_mutation or has_cl_mutation) and variant is not None
+        and variant.status in (400, 411, 413, 431, 501, 505)
+    )
 
     hypotheses = [
         Hypothesis("session variance", "benign",
@@ -862,6 +878,18 @@ def score_hypotheses(signals: List[Signal],
         Hypothesis("server does not support method", "benign",
                    ["status_reversal", "status_class_shift", "body_delta"],
                    0.95 if has_method_unsupported else 0.0),
+        Hypothesis("edge enforces host integrity", "benign",
+                   ["status_reversal", "status_class_shift", "body_delta",
+                    "cache_layer_disagreement"],
+                   0.95 if has_host_reject else 0.0),
+        Hypothesis("edge normalises host (redirect)", "benign",
+                   ["status_reversal", "status_class_shift", "redirect_target_delta",
+                    "body_delta"],
+                   0.95 if has_host_redirect else 0.0),
+        Hypothesis("edge rejects malformed framing", "benign",
+                   ["status_reversal", "status_class_shift", "body_delta",
+                    "cache_layer_disagreement"],
+                   0.95 if has_framing_reject else 0.0),
         Hypothesis("challenge page rotation", "benign",
                    ["ephemeral_only", "body_delta"],
                    0.95 if any(s.kind == "ephemeral_only" for s in signals) else 0.0),
