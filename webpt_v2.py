@@ -852,6 +852,11 @@ def score_hypotheses(signals: List[Signal],
         (has_te_mutation or has_cl_mutation) and variant is not None
         and variant.status in (400, 411, 413, 431, 501, 505)
     )
+    has_range_honored = (
+        "range" in _vh_lower
+        and variant is not None
+        and variant.status in (206, 416)
+    )
 
     hypotheses = [
         Hypothesis("session variance", "benign",
@@ -890,6 +895,9 @@ def score_hypotheses(signals: List[Signal],
                    ["status_reversal", "status_class_shift", "body_delta",
                     "cache_layer_disagreement"],
                    0.95 if has_framing_reject else 0.0),
+        Hypothesis("server honors range correctly", "benign",
+                   ["status_reversal", "status_class_shift", "body_delta"],
+                   0.95 if has_range_honored else 0.0),
         Hypothesis("challenge page rotation", "benign",
                    ["ephemeral_only", "body_delta"],
                    0.95 if any(s.kind == "ephemeral_only" for s in signals) else 0.0),
